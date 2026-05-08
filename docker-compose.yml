@@ -1,0 +1,43 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  dali2:
+    build:
+      context: ../DALI2
+      dockerfile: Dockerfile
+    init: true
+    ports:
+      - "${DALI2_PORT:-8080}:8080"
+    volumes:
+      - ../DALI2/web:/dali2/web
+      - ../DALI2/src:/dali2/src
+      - ./agents:/dali2/agents
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - DALI2_NODE=standalone
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    command: ["8080", "${DALI2_AGENT_FILE:-agents/webcam_planner.pl}"]
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  webcam_bridge:
+    build:
+      context: ./bridge
+      dockerfile: Dockerfile
+    environment:
+      - WINDY_API_KEY=${WINDY_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-openai/gpt-4o}
+      - WEBCAMS=${WEBCAMS}
+      - POLL_INTERVAL=${POLL_INTERVAL:-90}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    restart: unless-stopped
