@@ -9,38 +9,38 @@
 │                    Windy Webcam API                      │
 │         (public webcam snapshots of monuments)           │
 └────────────────────────┬────────────────────────────────┘
-                         │  HTTP (every 90s)
+                         │  HTTP (every 90s, rate-limited)
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │              Python Webcam Bridge                        │
 │  • Fetches preview images from Windy API                │
+│  • Skips fetch if fresh image is already cached         │
 │  • Sends images to GPT-4o (OpenRouter) for analysis     │
 │  • Publishes crowd_report events to DALI2 via LINDA     │
-└────────────────────────┬────────────────────────────────┘
-                         │  Redis pub/sub (LINDA channel)
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│                  DALI2 Agents                            │
-│  ┌─────────────┐  ┌──────────┐                          │
-│  │   planner   │  │ monitor  │                          │
-│  │ • beliefs   │  │ • logs   │                          │
-│  │ • planning  │  │ • alerts │                          │
-│  │ • AI advice │  │          │                          │
-│  └─────────────┘  └──────────┘                          │
-│         ↕ Redis star topology                           │
-│  ┌──────────────────────────────┐                       │
-│  │  Web UI (:8080) + REST API  │                        │
-│  └──────────────────────────────┘                       │
-└─────────────────────────────────────────────────────────┘
+│  • Caches image + analysis in Redis (TTL = 4×interval)  │
+└───────────┬────────────────────────┬────────────────────┘
+            │  Redis pub/sub (LINDA) │  Redis key-value cache
+            ▼                        ▼
+┌───────────────────────┐  ┌────────────────────────────┐
+│      DALI2 Agents     │  │     Public Frontend        │
+│  ┌────────┐ ┌───────┐ │  │  Flask on :9000            │
+│  │planner │ │monitor│ │  │  • Crowd cards + webcam    │
+│  │beliefs │ │ logs  │ │  │    snapshots (from cache)  │
+│  └────────┘ └───────┘ │  │  • Optimal visit route     │
+│  Web UI :8080 (admin) │  │  • Auto-refresh every 90s  │
+└───────────────────────┘  └────────────────────────────┘
 ```
 
 **Data flow:**
-1. **Webcam Bridge** fetches live snapshots from Windy public webcams
-2. Each image is sent to **GPT-4o** (via OpenRouter) which returns crowd level (0-10), weather, and visibility
-3. Results are published as `crowd_report` events to the DALI2 **planner** agent via Redis LINDA channel
-4. The **planner** agent maintains beliefs about each monument's crowd level and computes an optimal visit route (least crowded first)
-5. A **monitor** agent logs all events and provides situational awareness
-6. The **Web UI** shows agent beliefs, logs, and allows injecting `plan_visit` or `request_scan` events
+1. **Webcam Bridge** fetches live snapshots from Windy public webcams (at most once per `POLL_INTERVAL` per camera)
+2. If a fresh image is already cached in Redis, the fetch + GPT-4o call is skipped entirely to respect Windy API rate limits
+3. Each new image is sent to **GPT-4o** (via OpenRouter) which returns crowd level (0-10), weather, and visibility
+4. Results are published as `crowd_report` events to the DALI2 **planner** agent via Redis LINDA channel
+5. Image + analysis data are stored in Redis (`webcam:img:{id}`, `webcam:data:{id}`) with TTL = `POLL_INTERVAL × 4`
+6. The **planner** agent maintains beliefs about each monument's crowd level and computes an optimal visit route (least crowded first)
+7. A **monitor** agent logs all events and provides situational awareness
+8. The **public frontend** (:9000) reads data exclusively from the Redis cache — it never calls Windy directly
+9. The **admin Web UI** (:8080) shows raw agent beliefs, logs, and allows injecting events
 
 ## Quick Start (Docker)
 
@@ -52,7 +52,10 @@ cp .env.example .env
 # 2. Start all services
 docker compose up --build
 
-# 3. Open the DALI2 Web UI
+# 3. Open the public tourist planner
+# http://localhost:9000
+
+# 4. Open the DALI2 admin Web UI
 # http://localhost:8080
 ```
 
@@ -68,7 +71,9 @@ All settings are in `.env`:
 | `OPENROUTER_MODEL` | Vision model to use | `openai/gpt-4o` |
 | `POLL_INTERVAL` | Seconds between scans (min 60) | `90` |
 | `REDIS_HOST` | Redis hostname | `redis` |
-| `DALI2_PORT` | Web UI port | `8080` |
+| `DALI2_PORT` | Admin Web UI port | `8080` |
+| `FRONTEND_PORT` | Public tourist planner port | `9000` |
+| `APP_TITLE` | Title shown in the public UI | `Tourist Planner AI` |
 
 ### Adding Webcams
 
@@ -84,7 +89,13 @@ Find webcam IDs at [windy.com/webcams](https://www.windy.com/webcams).
 
 ## User Interaction
 
-**Via Web UI** (http://localhost:8080):
+**Public tourist planner** (http://localhost:9000):
+- View live webcam snapshots and crowd analysis for each monument
+- Colour-coded crowd indicator (green → red) and weather badges
+- Recommended visit order (least crowded first) computed by the DALI2 planner
+- Auto-refreshes every 90 s; images served from Redis cache (Windy API never called by the frontend)
+
+**Admin Web UI** (http://localhost:8080):
 - View real-time agent logs and beliefs
 - Inject `plan_visit` event to the `planner` agent to trigger route computation
 - Inject `request_scan` to force an immediate webcam refresh
@@ -120,6 +131,11 @@ swipl -l src/server.pl -g main -- 8080 ../DALI2-webcam-planner/agents/webcam_pla
 cd bridge
 pip install -r requirements.txt
 WINDY_API_KEY=... OPENROUTER_API_KEY=... WEBCAMS=... REDIS_HOST=localhost python webcam_bridge.py
+
+# Terminal 4: Public Frontend
+cd frontend
+pip install -r requirements.txt
+REDIS_HOST=localhost python app.py
 ```
 
 ## DALI2 Agents
@@ -135,6 +151,14 @@ WINDY_API_KEY=... OPENROUTER_API_KEY=... WEBCAMS=... REDIS_HOST=localhost python
 - Logs all system events with timestamps
 - Periodic status summaries
 - Situational awareness dashboard
+
+## Image Caching & API Rate Limits
+
+The Windy Webcam API imposes strict per-webcam rate limits.  The system enforces a hard boundary at two levels:
+
+1. **Bridge (webcam_bridge.py)** — before fetching a webcam, checks if `webcam:img:{id}` already exists in Redis.  If it does (TTL not expired), the fetch + GPT-4o analysis is skipped entirely for that camera in the current scan cycle.  The TTL is set to `POLL_INTERVAL × 4` seconds on write, so even forced `request_scan` events cannot trigger more than one API call per camera within that window.
+
+2. **Frontend (frontend/app.py)** — the public web app reads images exclusively from `webcam:img:{id}` in Redis via `GET /api/image/<id>`.  It never calls Windy directly.  The HTTP response carries `Cache-Control: public, max-age=<POLL_INTERVAL>` so browsers also avoid redundant requests within the same analysis window.
 
 ## License
 

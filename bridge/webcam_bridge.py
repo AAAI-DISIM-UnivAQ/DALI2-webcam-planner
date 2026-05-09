@@ -189,6 +189,11 @@ class WebcamBridge:
         for cam in self.webcams:
             if self._stop.is_set():
                 break
+            # Skip if a fresh cache already exists — respects Windy API rate limits
+            if self.r.exists(f"webcam:img:{cam.id}"):
+                log.info("── Skipping %s (%s) — cached image still fresh ──",
+                         cam.name, cam.id)
+                continue
             log.info("── Scanning %s (%s) ──", cam.name, cam.id)
 
             # 1. Fetch image URL from Windy
@@ -226,6 +231,24 @@ class WebcamBridge:
                 f"{cam.lat},{cam.lon})"
             )
             linda_publish(self.r, "planner", content)
+
+            # 5. Cache data + image in Redis for the public web UI
+            ttl = self.poll_interval * 4
+            self.r.hset(f"webcam:data:{cam.id}", mapping={
+                "id": cam.id,
+                "name": cam.name,
+                "crowd_level": crowd,
+                "weather": result.get("weather", "unknown"),
+                "crowd_description": result.get("crowd_description", ""),
+                "weather_description": result.get("weather_description", ""),
+                "visibility": result.get("visibility", "unknown"),
+                "lat": cam.lat,
+                "lon": cam.lon,
+                "updated_at": time.time(),
+            })
+            self.r.expire(f"webcam:data:{cam.id}", ttl)
+            self.r.set(f"webcam:img:{cam.id}", img_b64, ex=ttl)
+            self.r.sadd("webcam:ids", cam.id)
 
             # Small delay between webcam calls to be nice to APIs
             if cam != self.webcams[-1]:

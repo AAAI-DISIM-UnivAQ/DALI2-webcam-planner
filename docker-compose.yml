@@ -41,3 +41,17 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "${FRONTEND_PORT:-9000}:9000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - APP_TITLE=${APP_TITLE:-Tourist Planner AI}
+    depends_on:
+      - redis
+    restart: unless-stopped
